@@ -12,109 +12,84 @@ from model import ResNet18
 from trainer import train, evaluate
 
 def main():
-    # --- 기본 설정 ---
+    # --- 1. 기본 설정 및 하이퍼파라미터 ---
     set_seed(42)
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"DEVICE INFO: {DEVICE}")
 
-    # --- 하이퍼파라미터 설정 ---
+    # 고정된 최적 하이퍼파라미터
     NUM_EPOCHS = 300
     PATIENCE = 25
-    learning_rates = [0.1, 0.01]
-    batch_sizes = [64, 128]
+    BATCH_SIZE = 128  # 배치 사이즈는 일반적으로 64, 128 등 2의 거듭제곱을 사용합니다.
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+    BEST_MODEL_PATH = 'best_model.pth'
 
-    results = []
-    best_overall_loss = float('inf')
-    best_hyperparams = {}
+    # --- 2. 데이터 로더 준비 ---
+    train_loader, val_loader, test_loader = get_CIFAR10(train_ratio=0.9, batch_size=BATCH_SIZE)
 
-    search_num = 1
-    total_searches = len(learning_rates) * len(batch_sizes)
-    with tqdm(total=total_searches, desc='Hyperparameters Search') as outer_pbar:
-        for lr in learning_rates:
-            for batch_size in batch_sizes:
-                outer_pbar.set_description(f"Search #{search_num}: LR={lr}, Batch={batch_size}")
-                
-                train_loader, val_loader, _ = get_CIFAR10(train_ratio=0.9, batch_size=batch_size)
+    # --- 3. 모델, 손실 함수, 옵티마이저, 스케줄러 정의 ---
+    model = ResNet18().to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    # AdamW 옵티마이저와 CosineAnnealingLR 스케줄러 사용
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
-                model = ResNet18().to(DEVICE)
-                criterion = nn.CrossEntropyLoss()
-                optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.1)
+    # --- 4. 모델 학습 ---
+    best_val_loss = float('inf')
+    patience_counter = 0
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
-                best_run_loss = float('inf'); best_run_acc = 0; patience_counter = 0
-                train_loss_list, val_loss_list = [], []
-                train_acc_list, val_acc_list = [], []
+    print("===== Start Training =====")
+    for epoch in tqdm(range(1, NUM_EPOCHS + 1), desc="Training Progress"):
+        # Train
+        train_results = train(model, optimizer, criterion, train_loader, DEVICE)
+        history['train_loss'].append(train_results['loss'])
+        history['train_acc'].append(train_results['accuracy'])
 
-                epoch_pbar = tqdm(range(1, NUM_EPOCHS + 1), desc="Training")
-                final_epoch = 0
-                for epoch in epoch_pbar:
-                    final_epoch = epoch
+        # Validate
+        val_results = evaluate(model, criterion, val_loader, DEVICE)
+        history['val_loss'].append(val_results['loss'])
+        history['val_acc'].append(val_results['accuracy'])
+        
+        # 스케줄러 업데이트
+        scheduler.step()
 
-                    train_results = train(model, optimizer, criterion, train_loader)
-                    train_loss = train_results['loss']
-                    train_acc = train_results['accuracy']
+        # tqdm 진행률 표시줄에 현재 loss, acc 표시
+        tqdm.write(f"[Epoch {epoch:03d}] Train Loss: {train_results['loss']:.4f}, Val Loss: {val_results['loss']:.4f}, Val Acc: {val_results['accuracy']:.2f}%")
 
-                    val_results = evaluate(model, criterion, val_loader)
-                    val_loss = val_results['loss']
-                    val_acc = val_results['accuracy']
+        # Early Stopping 및 Best Model 저장
+        if val_results['loss'] < best_val_loss:
+            best_val_loss = val_results['loss']
+            torch.save(model.state_dict(), BEST_MODEL_PATH)
+            tqdm.write(f"✨ New Best Model Saved! Val Loss: {best_val_loss:.4f}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
-                    scheduler.step()
+    print("===== Training Finished =====")
+    plot_history(history['train_loss'], history['val_loss'], history['train_acc'], history['val_acc'])
 
-                    train_loss_list.append(train_loss); val_loss_list.append(val_loss)
-                    train_acc_list.append(train_acc); val_acc_list.append(val_acc)
 
-                    epoch_pbar.set_postfix({"Train Loss": f"{train_loss:.4f}", "Val Loss": f"{val_loss:.4f}", "Val Acc": f"{val_acc}"})
-
-                    if val_loss < best_run_loss:
-                        best_run_loss = val_loss
-                        best_run_acc = val_acc
-                        patience_counter = 0
-                        torch.save(model.state_dict(), f"best_model_run_{search_num}.pth")
-                        if val_loss < best_overall_loss:
-                            tqdm.write(f"\t✨ New BEST Overall Model! Val Loss: {val_loss:.4f} (Search #{search_num})")
-                            best_overall_loss = val_loss
-                            best_hyperparams = {'lr': lr, 'batch_size': batch_size}
-                            torch.save(model.state_dict(), 'best_overall_model.pth')
-                    else:
-                        patience_counter += 1
-                        if patience_counter >= PATIENCE:
-                            tqdm.write(f"Early stopping at epoch {epoch} for Search #{search_num}")
-                            break
-
-                results.append({'search_num': search_num,
-                                'learning_rate': lr,
-                                'batch_size': batch_size,
-                                'best_val_loss': best_run_loss,
-                                'best_val_acc': best_run_acc,
-                                'total_epochs': final_epoch})
-                
-                if os.path.exists(f"best_model_run_{search_num}.pth"):
-                    plot_history(train_loss_list, val_loss_list, train_acc_list, val_acc_list)
-                
-                outer_pbar.update(1)
-                search_num += 1
-
-    # --- 모든 탐색 종료 후 최종 결과 정리 ---
-    print("\n\n===== All Experiments Finished =====")
-    results_df = pd.DataFrame(results).sort_values(by='best_val_loss', ascending=True).reset_index(drop=True)
-    print("--- Hyperparameter Search Results ---\n", results_df)
-    results_df.to_csv('hyperparameter_search_results_tqdm.csv', index=False)
-
-    # --- 최종 테스트 평가 ---
-    if best_hyperparams:
-        print(f"\nBest validation loss: {best_overall_loss:.4f} with {best_hyperparams}")
-        print("\n==> Evaluating on test set with the best model...")
-
+    # --- 5. 최종 테스트 평가 ---
+    if os.path.exists(BEST_MODEL_PATH):
+        print("\n===== Evaluating on Test Set with the Best Model =====")
+        # 가장 성능이 좋았던 모델 state를 로드
         final_model = ResNet18().to(DEVICE)
-        final_model.load_state_dict(torch.load('best_overall_model.pth'))
-        
-        _, _, test_loader = get_CIFAR10(train_ratio=0.9, batch_size=best_hyperparams['batch_size'])
-        
-        final_test_results = evaluate(final_model, criterion, test_loader, is_test=True)
-        
+        final_model.load_state_dict(torch.load(BEST_MODEL_PATH))
+
+        final_test_results = evaluate(final_model, criterion, test_loader, DEVICE, is_test=True)
+
         print(f"Final Test Loss: {final_test_results['loss']:.4f}, Final Test Accuracy: {final_test_results['accuracy']:.2f}%")
-        
+
         plot_confmat(final_test_results['conf_matrix'], "Final Best Model", "final_best_model_confusion_matrix.png")
         print("Saved the final confusion matrix.")
     else:
         print("\nNo best model was saved. Final evaluation skipped.")
+
+
+if __name__ == '__main__':
+    main()
